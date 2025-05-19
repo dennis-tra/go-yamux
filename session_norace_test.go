@@ -167,3 +167,67 @@ func TestLargeWindow(t *testing.T) {
 		t.Fatalf("short write: %d", n)
 	}
 }
+
+func TestCloseRace(t *testing.T) {
+	// initialize client
+	clientConn, remoteConn := testConn()
+
+	// Block all writes to simulate a slow connection
+	clientConn.(*pipeConn).BlockWrites()
+
+	conf := testConf()
+	client, err := Client(clientConn, conf, nil)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// fill the send buffer with messages that the client
+	// wants to send until the buffer is full
+	for j := 0; j < 64; j++ {
+		client.sendCh <- []byte("some bytes")
+	}
+
+	// construct another random stream that both parties use
+	streamID := uint32(100)
+	_ = client.incomingStream(streamID)
+
+	// for synchronization purposes in this test we take the streamLock lock
+	// here. This allows us to semi-reliably wait until the message that we
+	// are about to send to the client gets handled in handleStreamMessage.
+	client.streamLock.Lock()
+
+	// construct dummy message to the client
+	hdr := encode(typeData, flagACK, streamID, 200)
+	remoteConn.Write(hdr[:])
+
+	// wait until we reach the streamLock in handleStreamMessage
+	time.Sleep(10 * time.Millisecond)
+
+	// close the connection so that stream.readData will fail
+	clientConn.Close()
+
+	// release the lock to continue execution of the handleStreamMessage method
+	client.streamLock.Unlock()
+
+	// unblock writes in the sendLoop. The connection is closed now so the
+	// write should fail which will then lets the sendLoop method to return.
+	clientConn.(*pipeConn).UnblockWrites()
+
+	// after sendLoop has returned the "send" method will wait until recvDoneCh
+	// is closed. However, this will never happen because handleStreamMessage
+	// is waiting to send a goAway message on the sendCh which isn't read anymore
+	time.Sleep(10 * time.Millisecond)
+
+	// calling close here then deadlocks.
+	closeDone := make(chan struct{})
+	go func() {
+		client.Close()
+		close(closeDone)
+	}()
+
+	select {
+	case <-closeDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout")
+	}
+}
